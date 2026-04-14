@@ -1,6 +1,7 @@
 import io
 import re
 
+from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 from num2words import num2words
@@ -53,16 +54,47 @@ def _is_blank(value) -> bool:
     s = str(value).strip()
     return s == "" or s == "0"
 
+def get_week_range_text():
+    today = datetime.today()
+
+    # Lunes como inicio de semana
+    start = today - timedelta(days=today.weekday())
+    end = start + timedelta(days=6)
+
+    meses = {
+        1: "ENERO", 2: "FEBRERO", 3: "MARZO", 4: "ABRIL",
+        5: "MAYO", 6: "JUNIO", 7: "JULIO", 8: "AGOSTO",
+        9: "SEPTIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE"
+    }
+
+    return f"SEMANA DEL {start.day:02d} DE {meses[start.month]} AL {end.day:02d} DE {meses[end.month]} DEL {end.year}"
 
 def _total_to_words(total) -> str:
     """Convert a numeric total to uppercase Spanish words."""
+    if pd.isna(total):
+        return ""
+
     try:
-        amount = float(total)
+        total_str = str(total).strip()
+        if total_str == "":
+            return ""
+
+        # Accept common decimal-comma input from spreadsheets.
+        if "," in total_str and "." not in total_str:
+            total_str = total_str.replace(",", ".")
+
+        amount = float(total_str)
     except (ValueError, TypeError):
         return str(total).upper()
 
+    if pd.isna(amount) or amount in (float("inf"), float("-inf")):
+        return ""
+
     integer_part = int(amount)
-    decimal_part = round((amount - integer_part) * 100)
+    decimal_part = int(round((amount - integer_part) * 100))
+    if decimal_part == 100:
+        integer_part += 1
+        decimal_part = 0
 
     words = num2words(integer_part, lang="es").upper()
     # Clean up extra spaces
@@ -76,7 +108,36 @@ def _total_to_words(total) -> str:
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Strip whitespace from column names and normalise accents lightly."""
-    df.columns = [c.strip() for c in df.columns]
+    alias_map = {
+        "15%": "15%",
+        "15": "15%",
+        "%15": "15%",
+        "0.15": "15%",
+        "0,15": "15%",
+        "DIRECCIÓN": "DIRECCION",
+        "DIRECCION": "DIRECCION",
+        "DIAFESTIVO": "DÍA FESTIVO",
+        "DÍAFESTIVO": "DÍA FESTIVO",
+    }
+
+    normalised = []
+    for col in df.columns:
+        if pd.isna(col):
+            normalised.append("")
+            continue
+        if isinstance(col, float) and col.is_integer():
+            col = int(col)
+
+        col_str = re.sub(r"\s+", " ", str(col)).strip()
+        col_upper = col_str.upper()
+        col_key = col_upper.replace(" ", "")
+
+        if col_key in alias_map:
+            normalised.append(alias_map[col_key])
+        else:
+            normalised.append(col_upper)
+
+    df.columns = normalised
     return df
 
 
@@ -85,29 +146,25 @@ def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_pdf(df: pd.DataFrame) -> bytes:
-    """Generate a PDF with one page per employee row in *df*."""
     buffer = io.BytesIO()
 
+    # Keep only rows with a real employee name to avoid blank payroll pages.
+    if "EMPLEADO" in df.columns:
+        df = df[~df["EMPLEADO"].apply(_is_blank)].reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "titulo",
-        parent=styles["Heading1"],
-        fontSize=13,
-        spaceAfter=2,
-        leading=16,
-    )
-    label_style = ParagraphStyle(
-        "label",
+
+    title_style = ParagraphStyle("title", parent=styles["Heading1"], fontSize=14, alignment=1)
+    subtitle_style = ParagraphStyle("subtitle", parent=styles["Normal"], fontSize=10, alignment=1)
+    normal_style = styles["Normal"]
+    bold_style = ParagraphStyle("bold", parent=styles["Normal"], fontName="Helvetica-Bold")
+    table_wrap_style = ParagraphStyle(
+        "table_wrap",
         parent=styles["Normal"],
-        fontSize=10,
-        spaceAfter=2,
-    )
-    bold_label_style = ParagraphStyle(
-        "bold_label",
-        parent=styles["Normal"],
-        fontSize=10,
-        fontName="Helvetica-Bold",
-        spaceAfter=4,
+        fontSize=9,
+        leading=11,
     )
 
     doc = BaseDocTemplate(
@@ -115,130 +172,106 @@ def build_pdf(df: pd.DataFrame) -> bytes:
         pagesize=letter,
         leftMargin=0.75 * inch,
         rightMargin=0.75 * inch,
-        topMargin=0.75 * inch,
-        bottomMargin=0.75 * inch,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
     )
 
-    frame = Frame(
-        doc.leftMargin,
-        doc.bottomMargin,
-        doc.width,
-        doc.height,
-        id="normal",
-    )
-    template = PageTemplate(id="main", frames=frame)
-    doc.addPageTemplates([template])
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height)
+    doc.addPageTemplates([PageTemplate(id="main", frames=frame)])
 
     story = []
 
     for idx, row in df.iterrows():
+
         nombre = _fmt(row.get("EMPLEADO", ""))
         direccion = _fmt(row.get("DIRECCION", ""))
-        total_hrs = row.get("TOTAL HRS", 0)
-        base_rate = row.get("$", 0)
-        bonus_15 = row.get("15%", 0)
-        prima = row.get("PRIMA", 0)
-        encargado = row.get("ENCARGADO", 0)
-        extras = row.get("EXTRAS", 0)
-        dia_festivo = row.get("DÍA FESTIVO", 0)
         total = row.get("TOTAL", 0)
 
-        # ── Header ──────────────────────────────────────────────────────────
-        story.append(Paragraph(nombre, title_style))
-        story.append(Paragraph(direccion, label_style))
-        story.append(Spacer(1, 0.15 * inch))
+        # ───────── HEADER ─────────
+        story.append(Paragraph("NÓMINA", title_style))
+        story.append(Paragraph(get_week_range_text(), subtitle_style))
+        story.append(Spacer(1, 10))
 
-        # ── Perceptions table ────────────────────────────────────────────────
-        header_row = [
-            Paragraph("<b>PERCEPCIONES</b>", bold_label_style),
-            Paragraph("<b>CANTIDAD</b>", bold_label_style),
+        story.append(Paragraph("<b>MELETO ES CAFÉ</b>", normal_style))
+        story.append(Paragraph("Cuauhtémoc, Chihuahua", normal_style))
+        story.append(Spacer(1, 15))
+
+        # ───────── EMPLOYEE INFO ─────────
+        story.append(Paragraph(f"<b>NOMBRE DEL EMPLEADO:</b> {nombre}", normal_style))
+        story.append(Paragraph("<b>DÍAS LABORADOS:</b> ", normal_style))
+        story.append(Paragraph("<b>DÍAS DE DESCANSO:</b> ", normal_style))
+        story.append(Paragraph(direccion, normal_style))
+        story.append(Paragraph("<b>DEPARTAMENTO:</b> ", normal_style))
+        story.append(Paragraph("<b>HORARIO:</b> ", normal_style))
+        story.append(Spacer(1, 15))
+
+        # ───────── TABLE ─────────
+        data = [
+            ["PERCEPCIONES", "CANTIDAD"],
+            ["Total acumulado en la semana", f"${_fmt(row.get('$'))} PESOS"],
+            ["Horas laboradas en la semana", f"{_fmt(row.get('TOTAL HRS'))} HORAS"],
+            ["Bonos", f"${_fmt(row.get('15%'))} PESOS"],
         ]
 
-        data = [header_row]
+        if not _is_blank(row.get("PRIMA")):
+            data.append(["Prima", f"${_fmt(row.get('PRIMA'))} PESOS"])
 
-        # Sueldo base
-        if not _is_blank(base_rate):
-            data.append([
-                "Sueldo base horario estudiante",
-                f"{_fmt(base_rate)} PESOS POR HORA",
-            ])
+        if not _is_blank(row.get("ENCARGADO")):
+            data.append(["Encargado", f"${_fmt(row.get('ENCARGADO'))} PESOS"])
 
-        # Horas laboradas
-        if not _is_blank(total_hrs):
-            data.append([
-                "Horas laboradas a la semana",
-                f"{_fmt(total_hrs)} HRS",
-            ])
+        if not _is_blank(row.get("EXTRAS")):
+            data.append(["Extras", f"${_fmt(row.get('EXTRAS'))} PESOS"])
 
-        # Prima dominical
-        prima_str = _fmt(prima)
-        if prima_str.upper() == "DESCANSO" or _is_blank(prima):
-            prima_display = "DESCANSO"
-        else:
-            prima_display = f"{prima_str} PESOS"
-        data.append(["Prima dominical", prima_display])
+        if not _is_blank(row.get("DÍA FESTIVO")):
+            data.append(["Día festivo", f"${_fmt(row.get('DÍA FESTIVO'))} PESOS"])
 
-        # 15%
-        if not _is_blank(bonus_15):
-            data.append([
-                "Puntualidad, asistencia, proactividad y uniforme completo (15%)",
-                f"{_fmt(bonus_15)} PESOS",
-            ])
-
-        # Leader de turno
-        if not _is_blank(encargado):
-            data.append(["Leader de turno", f"{_fmt(encargado)} PESOS"])
-
-        # Extras
-        if not _is_blank(extras):
-            data.append(["Horas extras", f"{_fmt(extras)} PESOS"])
-
-        # Día festivo
-        if not _is_blank(dia_festivo):
-            data.append(["Día festivo", f"{_fmt(dia_festivo)} PESOS"])
-
-        # Total
-        data.append([
-            Paragraph("<b>Total</b>", bold_label_style),
-            Paragraph(f"<b>{_fmt(total)} PESOS</b>", bold_label_style),
+        data.extend([
+            ["Total", f"${_fmt(total)} PESOS"],
+            ["Cantidad en letra", Paragraph(_total_to_words(total), table_wrap_style)],
         ])
 
-        # Cantidad en letra
-        data.append([
-            Paragraph("<b>Cantidad en letra</b>", bold_label_style),
-            Paragraph(
-                f"<b>{_total_to_words(total)}</b>",
-                bold_label_style,
-            ),
-        ])
-
-        col_widths = [doc.width * 0.65, doc.width * 0.35]
-        table = Table(data, colWidths=col_widths, repeatRows=1)
-        table.setStyle(
-            TableStyle([
-                # Header row
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 10),
-                # Body rows
-                ("FONTSIZE", (0, 1), (-1, -1), 9),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -3), [colors.white, colors.HexColor("#ECF0F1")]),
-                # Total and words rows
-                ("BACKGROUND", (0, -2), (-1, -1), colors.HexColor("#D5E8D4")),
-                # Grid
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                ("TOPPADDING", (0, 0), (-1, -1), 4),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ])
-        )
+        table = Table(data, colWidths=[doc.width * 0.65, doc.width * 0.35])
+        table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
 
         story.append(table)
+        story.append(Spacer(1, 20))
 
-        # Page break between employees (not after the last one)
+        # ───────── LEGAL TEXT ─────────
+        story.append(Paragraph(
+            "RECIBÍ DE MELETO ES CAFÉ LA CANTIDAD QUE SEÑALA ESTE RECIBO DE PAGO, "
+            "ESTANDO CONFORME CON LAS PERCEPCIONES Y LAS RETENCIONES ESCRITAS, "
+            "POR LO QUE CERTIFICO QUE NO SE ME ADEUDA CANTIDAD ALGUNA.",
+            normal_style
+        ))
+
+        story.append(Spacer(1, 60))
+
+        # ───────── SIGNATURES ─────────
+        signature_data = [
+            [
+                Paragraph("FIRMA DEL EMPLEADO: ____________________", normal_style),
+                Paragraph("FIRMA DEL SUPERVISOR: ____________________", normal_style),
+            ],
+            [
+                Paragraph("FECHA: ____ / ____ / ____", normal_style),
+                Paragraph("FECHA: ____ / ____ / ____", normal_style),
+            ],
+        ]
+        signature_table = Table(signature_data, colWidths=[doc.width * 0.5, doc.width * 0.5])
+        signature_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(signature_table)
+
         if idx < len(df) - 1:
             story.append(PageBreak())
 
@@ -273,12 +306,47 @@ if uploaded_file is not None:
                 f"Columnas encontradas: {', '.join(df.columns.tolist())}"
             )
         else:
-            st.success(f"✅ Archivo cargado correctamente — {len(df)} empleado(s) encontrado(s).")
-            st.dataframe(df, use_container_width=True)
+            total_rows = len(df)
+            df_nominas = df[~df["EMPLEADO"].apply(_is_blank)].copy()
+            st.success(
+                f"✅ Archivo cargado correctamente — {len(df_nominas)} nómina(s) válida(s) "
+                f"de {total_rows} fila(s)."
+            )
 
-            if st.button("Generar PDF de nóminas"):
+            # Summary view instead of rendering the full employee table.
+            for col in ["TOTAL", "TOTAL HRS", "$", "15%", "PRIMA", "ENCARGADO", "EXTRAS", "DÍA FESTIVO"]:
+                if col in df_nominas.columns:
+                    df_nominas[col] = pd.to_numeric(df_nominas[col], errors="coerce").fillna(0)
+
+            descartadas = total_rows - len(df_nominas)
+            total_nomina = float(df_nominas["TOTAL"].sum()) if "TOTAL" in df_nominas.columns else 0.0
+            total_horas = float(df_nominas["TOTAL HRS"].sum()) if "TOTAL HRS" in df_nominas.columns else 0.0
+
+            st.subheader("Resumen de nómina")
+
+            st.metric("Monto total de nómina", f"${total_nomina:,.2f}")
+
+            conceptos = ["$", "15%", "PRIMA", "ENCARGADO", "EXTRAS", "DÍA FESTIVO", "TOTAL"]
+            resumen_conceptos = []
+            for concepto in conceptos:
+                if concepto in df_nominas.columns:
+                    resumen_conceptos.append(
+                        {
+                            "Concepto": concepto,
+                            "Monto": float(df_nominas[concepto].sum()),
+                        }
+                    )
+
+            if resumen_conceptos:
+                resumen_df = pd.DataFrame(resumen_conceptos)
+                resumen_df["Monto"] = resumen_df["Monto"].map(lambda v: f"${v:,.2f}")
+                st.table(resumen_df)
+
+            if df_nominas.empty:
+                st.warning("No hay empleados con nombre para generar nóminas.")
+            elif st.button("Generar PDF de nóminas"):
                 with st.spinner("Generando PDF…"):
-                    pdf_bytes = build_pdf(df)
+                    pdf_bytes = build_pdf(df_nominas)
 
                 st.download_button(
                     label="⬇️ Descargar PDF",
